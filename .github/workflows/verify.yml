@@ -1,0 +1,79 @@
+name: Windows PDB and Ghidra proof
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: make test
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: MSVC x86 and LLVM environment
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $install = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$install) { throw 'MSVC installation missing' }
+          $command = '"' + $install + '\Common7\Tools\VsDevCmd.bat" -arch=x86 -host_arch=x64 >nul && set'
+          $environment = & cmd.exe /d /s /c $command
+          if ($LASTEXITCODE) { throw 'VsDevCmd failed' }
+          foreach ($line in $environment) {
+            $pair = $line -split '=', 2
+            if ($pair.Count -eq 2 -and $pair[0] -in @('INCLUDE', 'LIB', 'LIBPATH', 'PATH')) {
+              "$($pair[0])=$($pair[1])" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+          'C:\Program Files\LLVM\bin' | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Install pinned Ghidra
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'ghidra.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'ghidra'
+          Invoke-WebRequest 'https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.4.2_build/ghidra_11.4.2_PUBLIC_20250826.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne '795a02076af16257bd6f3f4736c4fc152ce9ff1f95df35cd47e2adc086e037a6') { throw 'Ghidra checksum mismatch' }
+          Expand-Archive $archive $destination
+          "GHIDRA_HOME=$destination\ghidra_11.4.2_PUBLIC" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "JAVA_HOME=$env:JAVA_HOME_21_X64" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build and verify real Windows artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          clang-cl --version
+          lld-link --version
+          llvm-pdbutil --version
+          python tests/test_static.py
+          if ($LASTEXITCODE) { throw 'Transport tests failed' }
+          $env:CTF_FLAG = 'Securinets_fst{ci_' + [guid]::NewGuid().ToString('N') + '}'
+          Write-Output "::add-mask::$env:CTF_FLAG"
+          python tools/build.py build --root .
+          if ($LASTEXITCODE) { throw 'Build or full verification failed' }
+      - name: Preserve verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-proof-${{ github.sha }}
+          path: |
+            dist/author/*.txt
+            dist/author/*.log
+          if-no-files-found: warn
+          retention-days: 14

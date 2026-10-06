@@ -5,15 +5,13 @@
 struct TRACE_BLOCK {
     uint16_t marker;
     uint16_t flags;
-    uint32_t encoded_sequence;
+    uint32_t encoded_offset;
     uint32_t stored_size;
     uint32_t decoded_size;
     uint32_t checksum;
-    uint32_t set_tag;
-    uint8_t pdb_guid[16];
-    uint32_t pdb_age;
-    uint32_t pdb_size;
+    uint32_t encoded_total_size;
 };
+static_assert(sizeof(TRACE_BLOCK) == 24, "trace block layout");
 
 struct LOT_RECORD {
     uint32_t lot_id;
@@ -76,7 +74,9 @@ int ReadLotRecord(uint32_t lot_id, LOT_RECORD* record);
 int ParseLotIdentifier(const char* text, uint32_t* lot_id);
 int ParseTraceBlock(const uint8_t* raw, uint32_t raw_size, TRACE_BLOCK* out);
 int NormalizeTraceBlock(TRACE_BLOCK* block);
-uint32_t DecodeTraceSequence(uint32_t encoded_sequence);
+uint32_t DecodeTraceOffset(uint32_t encoded_offset);
+uint32_t DecodeTraceTotalSize(uint32_t encoded_total_size);
+int ExpandTraceBlock(const TRACE_BLOCK* block, const uint8_t* stored, uint8_t* out, uint32_t out_size);
 uint32_t CalculateRecordCRC(const uint8_t* data, uint32_t size);
 int RestoreDebugBlock(const TRACE_BLOCK* block, const uint8_t* stored, uint8_t* out, uint32_t out_size);
 int VerifyTraceBlock(const TRACE_BLOCK* block, const uint8_t* decoded);

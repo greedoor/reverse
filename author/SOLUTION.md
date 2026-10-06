@@ -66,18 +66,16 @@ Each object starts with a binary header:
 struct TRACE_BLOCK {
     uint16_t marker;
     uint16_t flags;
-    uint32_t encoded_sequence;
+    uint32_t encoded_offset;
     uint32_t stored_size;
     uint32_t decoded_size;
     uint32_t crc32;
-    uint32_t set_tag;
-    uint8_t  pdb_guid[16];
-    uint32_t pdb_age;
-    uint32_t pdb_size;
+    uint32_t encoded_total_size;
 };
 ```
 
-The marker is `0xa7d3`, not a text magic.
+The marker is `0xa7d3`, not a text magic. The header is 24 bytes. It contains
+neither a set classifier nor a GUID/Age, and flags describe only transformations.
 
 ## 8. Transformations
 
@@ -87,12 +85,17 @@ The marker is `0xa7d3`, not a text magic.
 0 raw
 1 xor with 92 bf 13 47
 2 rotate-left-by-3 storage, so rotate right to decode
-3 zlib
+3 run-length expansion
 4 low-nibble subtract-11 storage, so add 11 to decode
 ```
 
 `flags & 8` means the stored bytes were reversed after the primary transform.
 Undo reversal before undoing the primary transform.
+
+Reverse `ExpandTraceBlock` for transform 3. Control bytes below `0x80` copy
+the following `control + 1` literals. Other controls repeat the next byte
+`(control & 0x7f) + 3` times. The decoder rejects truncated input, excess output,
+or a final decoded length mismatch. Every transform exists in the executable.
 
 ## 9. Fragment Decoding
 
@@ -104,22 +107,37 @@ The header CRC32 is over the decoded fragment bytes. All eight fragments pass.
 
 ## 11. Real/Decoy Separation
 
-Two fragments are real but from `RAVTEST.PDB`. They decode and CRC-check, but
-their GUID/Age differs from the `RAVTRACE.EXE` CodeView record.
+All eight objects decode and pass CRC. Recover their ranges and common total
+size, then follow only chains where each interval starts exactly at the preceding
+interval's end. Two intervals with a different internal boundary offer an
+alternative to the first two intervals, continuing into the same remaining ranges.
+Both complete covers use six objects. Neither count, CRC nor total size
+selects the correct path. No object carries an identity to filter in advance.
 
 ## 12. Ordering
 
-Logical sequence:
+Logical placement is a byte offset, not a sequence number:
 
 ```text
-sequence = (encoded_sequence >> 4) ^ 0x41c6
+offset = ror32(encoded_offset, 5) ^ 0x41c6a7d3
+total_size = encoded_total_size ^ 0x19920711
 ```
 
-Use only the six fragments whose GUID/Age match the executable.
+`DecodeTraceOffset` and `DecodeTraceTotalSize` implement these mappings. The
+reference script discovers intervals by binary marker, independent of section
+names and the author build map. It does not use the expected fragment count to
+prune the competing path; that count is an author verification invariant.
 
 ## 13. Reconstruction
 
-Sort matching fragments by sequence and concatenate.
+Construct both gap-free complete candidate files. Both use six fragments; the
+competing path replaces two genuine intervals with two foreign intervals having
+a different shared boundary. Parse the full MSF block map, stream directory, info stream, DBI and
+TPI/IPI streams. Only then extract each structurally valid candidate's GUID/Age
+and compare it to the EXE RSDS. A candidate may fail structural checks or have
+the wrong identity. The unique matching candidate is the correct reconstruction.
+The two foreign payloads are contiguous portions of the genuine RAVTEST PDB;
+they are not synthetic debug data and do not form its complete file.
 
 ```sh
 python3 author/reconstruct_reference.py RAVTRACE.EXE RAVTRACE.PDB
@@ -131,7 +149,9 @@ python3 author/reconstruct_reference.py RAVTRACE.EXE RAVTRACE.PDB
 llvm-pdbutil dump -summary RAVTRACE.PDB
 ```
 
-The file is a valid MSF 7.0 Microsoft-compatible PDB.
+The file must be accepted as an MSF 7.0 Microsoft-compatible PDB. Full build
+verification additionally parses private symbols/types with llvm-pdbutil. The
+original PDB is used only for a byte-for-byte assertion after candidate selection.
 
 ## 15. EXE/PDB Identity
 
@@ -144,7 +164,18 @@ Compare executable `RSDS` GUID/Age with PDB stream 1 GUID/Age. They match.
 2. Analyze normally.
 3. Place reconstructed `RAVTRACE.PDB` where Ghidra can find it or load it with
    the PDB analyzer.
-4. Re-run analysis.
+4. Re-run analysis. Confirm ValidateCandidate, TransformCandidate and
+   DeriveTraceKey functions and the five private structure types.
+
+Automated author proof (requires `GHIDRA_HOME`):
+
+```sh
+python3 author/verify_ghidra.py
+```
+
+This reconstructs the PDB again using only the packaged EXE. Separate headless
+imports assert that names/types are absent before PDB loading and present after.
+It checks the validator's context prototype and TRACE_BLOCK field offsets.
 
 ## 17. Private Symbol Analysis
 

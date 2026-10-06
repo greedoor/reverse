@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 import argparse
+import binascii
 import hashlib
 import os
 import shutil
 import struct
 import subprocess
 import sys
-import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 MARKER = 0xA7D3
-SEQ_MASK = 0x41C6
+OFFSET_MASK = 0x41C6A7D3
+TOTAL_MASK = 0x19920711
+MAX_PDB_SIZE = 0x4000000
 RESTORE_KEY = bytes([0x92, 0xBF, 0x13, 0x47])
-TRACE_TAG = 0x1300A11E
-DECOY_TAG = 0x0D0C0B0A
-HEADER = struct.Struct("<HHIIIII16sII")
+HEADER = struct.Struct("<HHIIIII")
 SECTION_ORDER = [
     (".cache", ("trace", 4)),
     (".old", ("decoy", 0)),
@@ -113,11 +113,12 @@ def compile_windows(root, build):
     lld_link = need_tool("lld-link")
     obj = build / "obj"
     trace_obj = obj / "ravtrace"
-    test_obj = obj / "ravtest"
+    test_obj = obj / "service"
     trace_obj.mkdir(parents=True, exist_ok=True)
     test_obj.mkdir(parents=True, exist_ok=True)
     common = [
         clang_cl, "/nologo", "/Zi", "/Od", "/MT", "/EHsc",
+        "/clang:--target=i686-pc-windows-msvc",
         "/D_CRT_SECURE_NO_WARNINGS", f"/I{root / 'src'}",
         f"/clang:-fdebug-compilation-dir=C:\\RAVEN\\DEV\\TRACE",
         f"/clang:-fdebug-prefix-map={root}=C:\\RAVEN\\DEV\\TRACE",
@@ -125,17 +126,18 @@ def compile_windows(root, build):
     trace_src = ["main.cpp", "trace.cpp", "validation.cpp"]
     trace_objs = []
     for name in trace_src:
-        out = trace_obj / (Path(name).stem + ".obj")
-        run(common + ["/c", str(root / "src" / name), f"/Fo{out}"])
+        out = (trace_obj / (Path(name).stem + ".obj")).relative_to(root)
+        run(common + ["/c", str(Path("src") / name), f"/Fo{out}"], cwd=root)
         trace_objs.append(out)
-    test_out = test_obj / "ravtest.obj"
-    run(common + ["/c", str(root / "src/ravtest.cpp"), f"/Fo{test_out}"])
-    run([lld_link, "/nologo", "/DEBUG", f"/PDB:{build / 'RAVTRACE_ORIGINAL.PDB'}",
+    test_out = (test_obj / "service.obj").relative_to(root)
+    run(common + ["/c", "src/service.cpp", f"/Fo{test_out}"], cwd=root)
+    link_options = [lld_link, "/nologo", "/DEBUG:FULL", "/INCREMENTAL:NO", "/OPT:NOREF", "/OPT:NOICF", "/MACHINE:X86", "/FILEALIGN:4096"]
+    run(link_options + [f"/PDB:{build / 'RAVTRACE_ORIGINAL.PDB'}",
          "/PDBALTPATH:C:\\RAVEN\\DEV\\TRACE\\RAVTRACE.PDB",
-         f"/OUT:{build / 'RAVTRACE_BASE.EXE'}", "/SUBSYSTEM:CONSOLE", *map(str, trace_objs)])
-    run([lld_link, "/nologo", "/DEBUG", f"/PDB:{build / 'RAVTEST_ORIGINAL.PDB'}",
+         f"/OUT:{build / 'RAVTRACE_BASE.EXE'}", "/SUBSYSTEM:CONSOLE", *map(str, trace_objs)], cwd=root)
+    run(link_options + [f"/PDB:{build / 'RAVTEST_ORIGINAL.PDB'}",
          "/PDBALTPATH:C:\\RAVEN\\DEV\\TRACE\\RAVTEST.PDB",
-         f"/OUT:{build / 'RAVTEST.EXE'}", "/SUBSYSTEM:CONSOLE", str(test_out)])
+         f"/OUT:{build / 'RAVTEST.EXE'}", "/SUBSYSTEM:CONSOLE", str(test_out)], cwd=root)
 
 
 @dataclass
@@ -232,43 +234,135 @@ class PE:
             va = align(va + len(payload), self.sec_align)
         struct.pack_into("<H", self.data, self.peoff + 6, self.nsec)
         struct.pack_into("<I", self.data, self.size_image_off, va)
+        initialized = struct.unpack_from("<I", self.data, self.opt + 8)[0]
+        struct.pack_into("<I", self.data, self.opt + 8, initialized + sum(align(len(payload), self.file_align) for _, payload in items))
 
     def custom_sections(self):
-        names = {name for name, _ in SECTION_ORDER}
-        return [(s.name, bytes(self.data[s.raw_ptr:s.raw_ptr + s.vsize])) for s in self.sections if s.name in names]
+        marker = struct.pack("<H", MARKER)
+        return [(s.name, bytes(self.data[s.raw_ptr:s.raw_ptr + s.vsize])) for s in self.sections
+                if self.data[s.raw_ptr:s.raw_ptr + 2] == marker]
 
 
-def pdb_identity(path):
-    data = Path(path).read_bytes()
-    if not data.startswith(b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0"):
-        die(f"{path}: invalid PDB MSF header")
-    block_size, free_map, block_count, dir_size = struct.unpack_from("<IIII", data, 32)
-    block_map = struct.unpack_from("<I", data, 52)[0]
-    dir_blocks = (dir_size + block_size - 1) // block_size
-    block_nums = []
-    pos = block_map * block_size
-    for _ in range(dir_blocks):
-        block_nums.append(struct.unpack_from("<I", data, pos)[0])
-        pos += 4
-    directory = bytearray()
-    for b in block_nums:
-        directory.extend(data[b * block_size:(b + 1) * block_size])
-    stream_count = struct.unpack_from("<I", directory, 0)[0]
-    sizes = list(struct.unpack_from("<" + "I" * stream_count, directory, 4))
+def pdb_identity_bytes(data):
+    """Validate the complete MSF layout and core PDB streams before returning identity."""
+    def require(condition, message):
+        if not condition:
+            raise ValueError(message)
+
+    require(len(data) >= 56 and data[:32] == b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0", "invalid MSF header")
+    block_size, free_map, block_count, dir_size, reserved, block_map = struct.unpack_from("<6I", data, 32)
+    require(block_size in (512, 1024, 2048, 4096) and free_map in (1, 2) and reserved == 0, "invalid MSF parameters")
+    require(block_count * block_size == len(data) and len(data) <= MAX_PDB_SIZE, "invalid MSF file size")
+    require(4 <= dir_size <= len(data) and 2 < block_map < block_count, "invalid stream directory")
+    count = (dir_size + block_size - 1) // block_size
+    require(count * 4 <= block_size, "directory block map too large")
+    dir_blocks = struct.unpack_from("<" + "I" * count, data, block_map * block_size)
+    occupied = {0, 1, 2, block_map}
+
+    def claim(blocks):
+        for block in blocks:
+            require(block < block_count and block not in occupied, "overlapping/out-of-bounds MSF block")
+            occupied.add(block)
+
+    def join(blocks, size):
+        return b"".join(data[b * block_size:(b + 1) * block_size] for b in blocks)[:size]
+
+    claim(dir_blocks)
+    directory = join(dir_blocks, dir_size)
+    stream_count = struct.unpack_from("<I", directory)[0]
+    require(5 <= stream_count <= (dir_size - 4) // 4, "invalid stream count")
+    sizes = struct.unpack_from("<" + "I" * stream_count, directory, 4)
     pos = 4 + 4 * stream_count
     streams = []
     for size in sizes:
-        n = 0 if size == 0xFFFFFFFF else (size + block_size - 1) // block_size
-        blocks = list(struct.unpack_from("<" + "I" * n, directory, pos)) if n else []
-        pos += 4 * n
-        blob = bytearray()
-        for b in blocks:
-            blob.extend(data[b * block_size:(b + 1) * block_size])
-        streams.append(bytes(blob[:0 if size == 0xFFFFFFFF else size]))
-    s1 = streams[1]
-    age = struct.unpack_from("<I", s1, 8)[0]
-    guid = s1[12:28]
-    return guid, age
+        require(size == 0xffffffff or size <= len(data), "invalid stream length")
+        n = 0 if size == 0xffffffff else (size + block_size - 1) // block_size
+        require(pos + n * 4 <= dir_size, "truncated stream block list")
+        blocks = struct.unpack_from("<" + "I" * n, directory, pos)
+        pos += n * 4
+        claim(blocks)
+        streams.append(join(blocks, 0 if size == 0xffffffff else size))
+    require(pos == dir_size, "trailing stream directory data")
+    info = streams[1]
+    require(len(info) >= 28 and struct.unpack_from("<I", info)[0] == 20000404, "invalid PDB info stream")
+    age = struct.unpack_from("<I", info, 8)[0]
+    require(age > 0, "invalid PDB age")
+    dbi = streams[3]
+    require(len(dbi) >= 64, "truncated DBI stream")
+    require(struct.unpack_from("<III", dbi) == (0xffffffff, 19990903, age), "invalid DBI header")
+    sizes = [struct.unpack_from("<i", dbi, p)[0] for p in (24, 28, 32, 36, 40, 48, 52)]
+    require(all(s >= 0 for s in sizes) and 64 + sum(sizes) == len(dbi), "invalid DBI substreams")
+    for p in (12, 16, 20):
+        index = struct.unpack_from("<H", dbi, p)[0]
+        require(index == 0xffff or index < stream_count, "invalid DBI stream reference")
+    for types in (streams[2], streams[4]):
+        require(len(types) >= 56, "truncated TPI/IPI stream")
+        version, header_size, begin, end, record_size = struct.unpack_from("<5I", types)
+        require(version == 20040203 and header_size == 56 and begin <= end and
+                header_size + record_size <= len(types), "invalid TPI/IPI header")
+        pos, records = header_size, 0
+        while pos < header_size + record_size:
+            require(pos + 4 <= header_size + record_size, "truncated type record")
+            size = struct.unpack_from("<H", types, pos)[0] + 2
+            require(size >= 4 and pos + size <= header_size + record_size, "invalid type record length")
+            pos += size
+            records += 1
+        require(records == end - begin, "incorrect type record count")
+    return info[12:28], age
+
+
+def pdb_identity(path):
+    try:
+        return pdb_identity_bytes(Path(path).read_bytes())
+    except ValueError as error:
+        die(f"{path}: {error}")
+
+
+def encode_offset(offset):
+    value = offset ^ OFFSET_MASK
+    return ((value << 5) | (value >> 27)) & 0xffffffff
+
+
+def decode_offset(encoded):
+    return ((encoded >> 5) | ((encoded << 27) & 0xffffffff)) ^ OFFSET_MASK
+
+
+def encode_rle(data):
+    out = bytearray()
+    pos = 0
+    while pos < len(data):
+        run = 1
+        while run < 130 and pos + run < len(data) and data[pos + run] == data[pos]:
+            run += 1
+        if run >= 3:
+            out.extend((0x80 | (run - 3), data[pos]))
+            pos += run
+        else:
+            start = pos
+            while pos < len(data) and pos - start < 128:
+                if pos + 2 < len(data) and data[pos] == data[pos + 1] == data[pos + 2]:
+                    break
+                pos += 1
+            out.append(pos - start - 1)
+            out.extend(data[start:pos])
+    return bytes(out)
+
+
+def decode_rle(data, decoded_size):
+    out = bytearray()
+    pos = 0
+    while pos < len(data):
+        control = data[pos]
+        pos += 1
+        count = (control & 0x7f) + 3 if control & 0x80 else control + 1
+        consumed = 1 if control & 0x80 else count
+        if pos + consumed > len(data) or len(out) + count > decoded_size:
+            die("invalid RLE block")
+        out.extend(bytes([data[pos]]) * count if control & 0x80 else data[pos:pos + count])
+        pos += consumed
+    if len(out) != decoded_size:
+        die("truncated RLE output")
+    return bytes(out)
 
 
 def encode_payload(decoded, base, rev):
@@ -280,16 +374,18 @@ def encode_payload(decoded, base, rev):
         for i, b in enumerate(data):
             data[i] = ((b << 3) | (b >> 5)) & 0xFF
     elif base == 3:
-        data = bytearray(zlib.compress(bytes(data), 9))
+        data = bytearray(encode_rle(data))
     elif base == 4:
         for i, b in enumerate(data):
             data[i] = (b & 0xF0) | ((b - 11) & 0x0F)
+    elif base != 0:
+        die("unsupported transform")
     if rev:
         data.reverse()
     return bytes(data)
 
 
-def decode_payload(stored, base, rev):
+def decode_payload(stored, base, rev, decoded_size):
     data = bytearray(stored)
     if rev:
         data.reverse()
@@ -300,10 +396,12 @@ def decode_payload(stored, base, rev):
         for i, b in enumerate(data):
             data[i] = ((b >> 3) | (b << 5)) & 0xFF
     elif base == 3:
-        data = bytearray(zlib.decompress(bytes(data)))
+        data = bytearray(decode_rle(bytes(data), decoded_size))
     elif base == 4:
         for i, b in enumerate(data):
             data[i] = (b & 0xF0) | ((b + 11) & 0x0F)
+    elif base != 0:
+        die("unsupported transform")
     return bytes(data)
 
 
@@ -312,41 +410,35 @@ def split_six(data):
     return [data[a:b] for a, b in zip([0] + cuts, cuts + [len(data)])]
 
 
-def split_decoys(data):
-    a = len(data) * 19 // 100
-    b = len(data) * 43 // 100
-    c = len(data) * 61 // 100
-    return [data[a:b], data[b:c]]
-
-
-def make_object(kind, seq, chunk, guid, age, full_size):
-    base, rev = TRANSFORMS[(kind, seq)]
+def make_object(offset, chunk, full_size, base, rev=0):
     stored = encode_payload(chunk, base, rev)
     flags = base | rev
-    enc_seq = ((seq ^ SEQ_MASK) << 4) | ((len(chunk) ^ (TRACE_TAG if kind == "trace" else DECOY_TAG)) & 0xF)
-    hdr = HEADER.pack(MARKER, flags, enc_seq, len(stored), len(chunk), zlib.crc32(chunk) & 0xFFFFFFFF,
-                      TRACE_TAG if kind == "trace" else DECOY_TAG, guid, age, full_size)
+    hdr = HEADER.pack(MARKER, flags, encode_offset(offset), len(stored), len(chunk),
+                      binascii.crc32(chunk) & 0xffffffff, full_size ^ TOTAL_MASK)
     return hdr + stored
 
 
 def parse_object(blob):
     if len(blob) < HEADER.size:
         die("short fragment object")
-    marker, flags, enc, stored_size, decoded_size, crc, tag, guid, age, pdb_size = HEADER.unpack_from(blob)
-    if marker != MARKER:
-        die("bad fragment marker")
+    marker, flags, enc, stored_size, decoded_size, crc, encoded_total = HEADER.unpack_from(blob)
+    offset, total = decode_offset(enc), encoded_total ^ TOTAL_MASK
+    if marker != MARKER or flags & ~0x0f or (flags & 7) > 4:
+        die("invalid fragment header")
+    if not (0 < stored_size <= 0x400000 and 0 < decoded_size <= 0x400000 and
+            0 < total <= MAX_PDB_SIZE and offset < total and decoded_size <= total - offset):
+        die("invalid fragment range/size")
     stored = blob[HEADER.size:HEADER.size + stored_size]
     if len(stored) != stored_size:
         die("short fragment payload")
     base, rev = flags & 7, flags & 8
-    decoded = decode_payload(stored, base, rev)
+    decoded = decode_payload(stored, base, rev, decoded_size)
     if len(decoded) != decoded_size:
         die("decoded size mismatch")
-    if (zlib.crc32(decoded) & 0xFFFFFFFF) != crc:
+    if (binascii.crc32(decoded) & 0xFFFFFFFF) != crc:
         die("fragment CRC mismatch")
-    seq = (enc >> 4) ^ SEQ_MASK
     return {
-        "seq": seq, "tag": tag, "guid": guid, "age": age, "pdb_size": pdb_size,
+        "offset": offset, "total_size": total,
         "decoded": decoded, "flags": flags, "stored_size": stored_size,
     }
 
@@ -354,46 +446,71 @@ def parse_object(blob):
 def inject_fragments(base_exe, trace_pdb, test_pdb, out_exe):
     trace_data = Path(trace_pdb).read_bytes()
     test_data = Path(test_pdb).read_bytes()
-    trace_guid, trace_age = pdb_identity(trace_pdb)
-    test_guid, test_age = pdb_identity(test_pdb)
-    chunks = {
-        "trace": split_six(trace_data),
-        "decoy": split_decoys(test_data),
-    }
+    if pdb_identity(trace_pdb) == pdb_identity(test_pdb):
+        die("second PDB identity must differ")
+    chunks = split_six(trace_data)
     objects = {}
-    for kind in ("trace", "decoy"):
-        guid, age, full = (trace_guid, trace_age, len(trace_data)) if kind == "trace" else (test_guid, test_age, len(test_data))
-        for seq, chunk in enumerate(chunks[kind]):
-            objects[(kind, seq)] = make_object(kind, seq, chunk, guid, age, full)
+    offset = 0
+    for i, chunk in enumerate(chunks):
+        objects[("trace", i)] = make_object(offset, chunk, len(trace_data), *TRANSFORMS[("trace", i)])
+        offset += len(chunk)
+    # A different boundary makes two foreign pieces compete with two genuine intervals.
+    end = len(chunks[0]) + len(chunks[1])
+    middle = end * 47 // 100
+    if len(test_data) < end or not middle:
+        die("second PDB too small for competing prefix")
+    for i, (start, stop) in enumerate(((0, middle), (middle, end))):
+        objects[("decoy", i)] = make_object(start, test_data[start:stop], len(trace_data), *TRANSFORMS[("decoy", i)])
     pe = PE(Path(base_exe).read_bytes())
     pe.add_sections([(name, objects[key]) for name, key in SECTION_ORDER])
     Path(out_exe).write_bytes(pe.data)
 
 
-def reconstruct_from_exe(exe, out_pdb, expected_guid=None, expected_age=None, original=None):
+def interval_candidates(objects):
+    """Walk only gap-free interval chains; neither section names nor fragment counts select a set."""
+    for total in sorted({obj["total_size"] for obj in objects}):
+        by_offset = {}
+        for obj in objects:
+            if obj["total_size"] == total:
+                by_offset.setdefault(obj["offset"], []).append(obj)
+
+        def walk(offset, chain):
+            if offset == total:
+                yield chain
+            for obj in by_offset.get(offset, ()):
+                yield from walk(offset + len(obj["decoded"]), chain + [obj])
+
+        yield from walk(0, [])
+
+
+def reconstruct_from_exe(exe, out_pdb, original=None):
     pe = PE(Path(exe).read_bytes())
-    if expected_guid is None:
-        expected_guid, expected_age, _ = pe.debug_codeview()
-    good = []
+    expected_guid, expected_age, _ = pe.debug_codeview()
     all_objs = []
     for name, blob in pe.custom_sections():
         obj = parse_object(blob)
         obj["section"] = name
         all_objs.append(obj)
-        if obj["guid"] == expected_guid and obj["age"] == expected_age and obj["tag"] == TRACE_TAG:
-            good.append(obj)
-    if len(good) != 6:
-        die(f"expected 6 matching fragments, got {len(good)}")
-    seqs = sorted(o["seq"] for o in good)
-    if seqs != list(range(6)):
-        die(f"bad real fragment sequence set: {seqs}")
-    data = b"".join(o["decoded"] for o in sorted(good, key=lambda o: o["seq"]))
-    if len({o["pdb_size"] for o in good}) != 1 or len(data) != good[0]["pdb_size"]:
-        die("reconstructed PDB size mismatch")
+    matches, candidates = [], []
+    for chain in interval_candidates(all_objs):
+        data = b"".join(obj["decoded"] for obj in chain)
+        candidate = {"sections": [obj["section"] for obj in chain]}
+        try:
+            identity = pdb_identity_bytes(data)
+            candidate["guid"], candidate["age"] = identity[0].hex(), identity[1]
+            candidate["status"] = "match" if identity == (expected_guid, expected_age) else "identity mismatch"
+        except ValueError as error:
+            candidate["status"] = "invalid PDB: " + str(error)
+        candidates.append(candidate)
+        if candidate["status"] == "match":
+            matches.append((data, chain))
+    if len(matches) != 1:
+        die(f"expected one structurally valid matching PDB, got {len(matches)} from {len(candidates)} interval covers")
+    data, selected = matches[0]
     Path(out_pdb).write_bytes(data)
     if original and Path(original).read_bytes() != data:
         die("reconstructed PDB differs from original")
-    return all_objs
+    return {"objects": all_objs, "selected": selected, "candidates": candidates}
 
 
 def package(root, dist):

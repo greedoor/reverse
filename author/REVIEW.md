@@ -1,6 +1,6 @@
 # Maintainer Review
 
-Baseline: `a25f983ad26fc8838e510933fc31851ad4a82962`, matching GitHub `main`.
+First-pass baseline: `a25f983ad26fc8838e510933fc31851ad4a82962` (historical).
 The original two checks in `tests/test_static.py` passed before modification.
 The checkout contains source/build tooling, but no generated EXE/PDB/ZIP.
 This environment has host clang++, but lacks clang-cl, lld-link, Windows SDK
@@ -57,3 +57,42 @@ profiles, modes, handlers, fields, and result codes. It is not a cryptographic
 requirement or a runtime unlock file. Confirm the difficulty with a blind solve
 of the rebuilt player ZIP and compare Ghidra views before/after PDB loading.
 Neither that blind solve nor the Ghidra comparison is claimed as completed here.
+
+## Final Hardening
+
+Baseline: `d7951dafc2a464219a3c2873a0275a9a9beabe73`, confirmed on local and
+GitHub main. `make test` passed before edits.
+
+Fragment headers now contain only marker, transform flags, encoded byte offset,
+stored/decoded sizes, decoded CRC32, and encoded total size. Each of the eight
+objects advertises the same total. Two contiguous genuine RAVTEST prefix slices
+compete with the first two RAVTRACE intervals, using a different shared boundary.
+There are two gap-free complete covers, each containing six objects. The
+reference reconstructor does not know the genuine count or section map; it
+tests both complete candidates and checks identity only after MSF/PDB parsing.
+The optional original is consulted solely for a post-selection byte comparison.
+The second program uses neutral service/source/symbol names rather than test
+labels in its records; RAVTEST remains the author-only artifact filename.
+
+RLE replaces the builder-only compression path. The same literal/run format is
+implemented in Python and ExpandTraceBlock, including reverse storage, bounded
+expansion, truncated input checks, and exact decoded size. The native harness
+enumerates every configured transform and checks production C++ against the
+Python encoder under ASan/UBSan. Parser fixtures also check wrong identity after
+assembly, block bounds/overlap, invalid DBI/TPI headers, and CRC corruption.
+These fixtures are synthetic unit-test data, not claimed compiler artifacts.
+
+The native Windows workflow now targets PE32/x86, preserves all debug routines,
+builds genuine private PDBs, reconstructs, checks hashes/identity, uses the LLVM
+readers, runs the terminal acceptance/rejection cases, and asserts Ghidra
+functions/prototypes/structure fields before and after loading the recovered
+PDB. The full verifier requires every stage and writes no success report when
+a required tool or runtime is absent. Ghidra itself reconstructs from the player
+ZIP without the author original. CI archives verification evidence, not PDBs.
+
+Local Windows/PDB/Ghidra proof is still unavailable: clang-cl, lld-link, the
+Windows SDK/runtime libraries, Wine, and Ghidra are absent. LLVM readers are
+installed outside PATH. GitHub publishing/execution must succeed before the
+new workflow constitutes CI proof. No successful CI run or rebuilt Windows
+artifact is claimed merely from adding the workflow. A blind participant solve
+and solve-time calibration remain release review requirements.

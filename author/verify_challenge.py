@@ -9,8 +9,9 @@ from zipfile import ZipFile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from ravtools import (DECOY_TAG, TRACE_TAG, PE, pdb_identity, reconstruct_from_exe,
+from ravtools import (HEADER, PE, pdb_identity, reconstruct_from_exe,
                       sha256)
+from verify_ghidra import verify_ghidra
 
 BAD_WORDS = [
     b"Securinets_fst{",
@@ -27,6 +28,10 @@ SYMBOLS = [
     b"TransformCandidate",
     b"DeriveTraceKey",
     b"RestoreDebugBlock",
+    b"ExpandTraceBlock",
+    b"DecodeTraceOffset",
+    b"DecodeTraceTotalSize",
+    b"TRACE_BLOCK",
     b"TRACE_CONTEXT",
     b"VALIDATION_STATE",
     b"TRACE_PROFILE",
@@ -112,23 +117,44 @@ def main():
     reconstructed = dist / "author/RAVTRACE_RECONSTRUCTED.PDB"
     ravtest = dist / "author/RAVTEST_ORIGINAL.PDB"
     zip_path = dist / "player/RAVTRACE.ZIP"
+    (dist / "author/verification-report.txt").unlink(missing_ok=True)
     for p in (exe, original, reconstructed, ravtest, zip_path):
         if not p.exists():
             fail(f"missing artifact: {p}")
 
     pe = PE(read(exe))
+    if pe.machine != 0x14c or pe.is64:
+        fail("expected PE32/x86 build")
+    if len(read(exe)) != max(section.raw_ptr + section.raw_size for section in pe.sections):
+        fail("unexpected PE overlay")
+    reader = os.environ.get("LLVM_READOBJ") or shutil.which("llvm-readobj")
+    if not reader:
+        fail("llvm-readobj required (or set LLVM_READOBJ)")
+    inspected = subprocess.run([reader, "--file-headers", "--sections", "--coff-debug-directory", str(exe)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    if inspected.returncode or b"RAVTRACE.PDB" not in inspected.stdout:
+        fail("independent PE/CodeView inspection failed")
+    (dist / "author/pe-inspection.txt").write_bytes(inspected.stdout)
     guid, age, path = pe.debug_codeview()
     if not path.endswith("RAVTRACE.PDB") or "C:\\RAVEN\\DEV\\TRACE" not in path:
         fail(f"unexpected CodeView path: {path}")
     ok("PE and CodeView debug directory")
 
-    objs = reconstruct_from_exe(exe, reconstructed, guid, age, original)
-    real = [o for o in objs if o["tag"] == TRACE_TAG and o["guid"] == guid and o["age"] == age]
-    decoy = [o for o in objs if o["tag"] == DECOY_TAG]
+    result = reconstruct_from_exe(exe, reconstructed, original=original)
+    objs, real = result["objects"], result["selected"]
+    chosen = {obj["section"] for obj in real}
+    decoy = [o for o in objs if o["section"] not in chosen]
     if len(objs) != 8 or len(real) != 6 or len(decoy) != 2:
         fail("fragment real/decoy count mismatch")
-    if sorted(o["seq"] for o in real) != list(range(6)):
-        fail("real fragment order metadata invalid")
+    if HEADER.size != 24 or len(result["candidates"]) != 2:
+        fail("unexpected header or interval ambiguity")
+    foreign = read(ravtest)
+    for obj in decoy:
+        start = obj["offset"]
+        if obj["decoded"] != foreign[start:start + len(obj["decoded"])]:
+            fail("unused candidate fragment is not genuine RAVTEST data")
+        if obj["total_size"] != len(read(original)):
+            fail("decoy total size discloses classification")
     ok("8 fragments decode and CRC-check")
 
     if sha256(original) != sha256(reconstructed):
@@ -155,12 +181,19 @@ def main():
     if b"Microsoft C/C++ MSF 7.00" in read(exe):
         fail("full MSF header visible in EXE")
     ok("binary leak checks")
+    for data in (pdb_data, read(ravtest)):
+        for word in (flag.encode(), b"/home/", b"/workspace/", b"\\Users\\", b"/github/workspace/",
+                     b"traitor", b"exchange location", b"GetFlag", b"DecryptRealFlag"):
+            if word.lower() in data.lower():
+                fail(f"reconstructable PDB leak: {word!r}")
 
     members = zip_bytes(zip_path)
     expected = {"RAVTRACE.EXE", "README.NFO", "FILE_ID.DIZ"}
     if set(members) != expected:
         fail(f"bad ZIP members: {sorted(members)}")
     joined = b"\n".join(members.values())
+    if members["RAVTRACE.EXE"] != read(exe):
+        fail("packaged EXE differs from verified EXE")
     for name in members:
         if name.upper().endswith((".PDB", ".CPP", ".HPP", ".PY")):
             fail(f"author file in player ZIP: {name}")
@@ -170,6 +203,7 @@ def main():
     ok("player package contents")
 
     run_exe(exe, flag)
+    verify_ghidra(zip_path, dist / "author")
 
     report = dist / "author/verification-report.txt"
     report.write_text(
@@ -183,7 +217,9 @@ def main():
         "pdb_tool_validation: PASS\n"
         "real_fragments: 6\n"
         "decoys: 2\n"
-        "ghidra_symbol_import: MANUAL VERIFICATION REQUIRED\n"
+        "interval_candidates: 2\n"
+        "fragment_identity_metadata: ABSENT\n"
+        "ghidra_symbol_import: PASS\n"
         "flag_leak_scan: PASS\n"
         "story_spoiler_scan: PASS\n"
         "player_package: PASS\n"

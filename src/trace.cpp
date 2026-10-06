@@ -36,6 +36,10 @@ __declspec(noinline) int LoadTraceHeader(const TRACE_BLOCK* block) {
     if (block->marker != kTraceMarker) return 0;
     if (block->stored_size == 0 || block->decoded_size == 0) return 0;
     if (block->stored_size > 0x400000 || block->decoded_size > 0x400000) return 0;
+    if ((block->flags & ~0x0fu) || (block->flags & 7u) > 4u) return 0;
+    uint32_t total = DecodeTraceTotalSize(block->encoded_total_size);
+    uint32_t offset = DecodeTraceOffset(block->encoded_offset);
+    if (!total || total > 0x4000000u || offset >= total || block->decoded_size > total - offset) return 0;
     return 1;
 }
 
@@ -59,17 +63,22 @@ __declspec(noinline) int ParseLotIdentifier(const char* text, uint32_t* lot_id) 
 __declspec(noinline) int ParseTraceBlock(const uint8_t* raw, uint32_t raw_size, TRACE_BLOCK* out) {
     if (!raw || !out || raw_size < sizeof(TRACE_BLOCK)) return 0;
     memcpy(out, raw, sizeof(TRACE_BLOCK));
+    if (out->stored_size > raw_size - sizeof(TRACE_BLOCK)) return 0;
     return LoadTraceHeader(out);
 }
 
 __declspec(noinline) int NormalizeTraceBlock(TRACE_BLOCK* block) {
     if (!LoadTraceHeader(block)) return 0;
-    block->flags &= 0x001f;
+    block->flags &= 0x000f;
     return 1;
 }
 
-__declspec(noinline) uint32_t DecodeTraceSequence(uint32_t encoded_sequence) {
-    return (encoded_sequence >> 4) ^ 0x41c6u;
+__declspec(noinline) uint32_t DecodeTraceOffset(uint32_t encoded_offset) {
+    return ((encoded_offset >> 5) | (encoded_offset << 27)) ^ 0x41c6a7d3u;
+}
+
+__declspec(noinline) uint32_t DecodeTraceTotalSize(uint32_t encoded_total_size) {
+    return encoded_total_size ^ 0x19920711u;
 }
 
 __declspec(noinline) uint32_t CalculateRecordCRC(const uint8_t* data, uint32_t size) {
@@ -82,14 +91,37 @@ __declspec(noinline) uint32_t CalculateRecordCRC(const uint8_t* data, uint32_t s
     return ~crc;
 }
 
+static uint8_t ReadStoredByte(const TRACE_BLOCK* block, const uint8_t* stored, uint32_t index) {
+    return stored[(block->flags & 8u) ? block->stored_size - 1u - index : index];
+}
+
+__declspec(noinline) int ExpandTraceBlock(const TRACE_BLOCK* block, const uint8_t* stored, uint8_t* out, uint32_t out_size) {
+    if (!LoadTraceHeader(block) || !stored || !out || out_size < block->decoded_size) return 0;
+    uint32_t src = 0, dst = 0;
+    while (src < block->stored_size) {
+        uint8_t control = ReadStoredByte(block, stored, src++);
+        uint32_t count = (control & 0x80u) ? (control & 0x7fu) + 3u : control + 1u;
+        if (count > block->decoded_size - dst) return 0;
+        if (control & 0x80u) {
+            if (src == block->stored_size) return 0;
+            uint8_t value = ReadStoredByte(block, stored, src++);
+            for (uint32_t i = 0; i < count; ++i) out[dst++] = value;
+        } else {
+            if (count > block->stored_size - src) return 0;
+            for (uint32_t i = 0; i < count; ++i) out[dst++] = ReadStoredByte(block, stored, src++);
+        }
+    }
+    return dst == block->decoded_size;
+}
+
 __declspec(noinline) int RestoreDebugBlock(const TRACE_BLOCK* block, const uint8_t* stored, uint8_t* out, uint32_t out_size) {
     if (!LoadTraceHeader(block) || !stored || !out || out_size < block->decoded_size) return 0;
-    if ((block->flags & 7u) == 3u) return 0;
+    if ((block->flags & 7u) == 3u)
+        return ExpandTraceBlock(block, stored, out, out_size) && VerifyTraceBlock(block, out);
     if (block->stored_size != block->decoded_size) return 0;
 
     for (uint32_t i = 0; i < block->stored_size; ++i) {
-        uint32_t si = (block->flags & 8u) ? block->stored_size - 1u - i : i;
-        uint8_t b = stored[si];
+        uint8_t b = ReadStoredByte(block, stored, i);
         switch (block->flags & 7u) {
         case 1: b ^= kRestoreKey[i & 3u]; break;
         case 2: b = ror8(b, 3); break;

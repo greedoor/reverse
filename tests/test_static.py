@@ -6,8 +6,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from ravtools import (PE, SECTION_ORDER, make_object, parse_object,
-                      reconstruct_from_exe, split_six)
+from ravtools import (HEADER, PE, SECTION_ORDER, TRANSFORMS, interval_candidates, make_object,
+                      parse_object, pdb_identity_bytes, reconstruct_from_exe, split_six)
+from msf_fixture import synthetic_pdb
 
 
 def test_required_files_exist():
@@ -59,17 +60,25 @@ def test_codeview_and_fragment_pipeline():
         assert pe.debug_codeview() == (guid, age, path)
         struct.pack_into("<I", pe.data, 0x418, 0)
         assert pe.debug_codeview() == (guid, age, path)
-        original = bytes(range(256)) * 79
+        original = synthetic_pdb(guid)
+        foreign = synthetic_pdb(b"D" * 16)
         chunks = split_six(original)
-        objects = {("trace", i): make_object("trace", i, chunk, guid, age, len(original))
-                   for i, chunk in enumerate(chunks)}
-        for i in range(2):
-            objects[("decoy", i)] = make_object("decoy", i, b"transport decoy" * 97,
-                                               b"D" * 16, 2, 65536)
+        objects, offset = {}, 0
+        for i, chunk in enumerate(chunks):
+            objects[("trace", i)] = make_object(offset, chunk, len(original), *TRANSFORMS[("trace", i)])
+            offset += len(chunk)
+        end = len(chunks[0]) + len(chunks[1])
+        middle = end * 47 // 100
+        for i, (start, stop) in enumerate(((0, middle), (middle, end))):
+            objects[("decoy", i)] = make_object(start, foreign[start:stop], len(original), *TRANSFORMS[("decoy", i)])
         for key, blob in objects.items():
             obj = parse_object(blob)
-            assert obj["seq"] == key[1]
-            assert obj["decoded"] == (chunks[key[1]] if key[0] == "trace" else b"transport decoy" * 97)
+            assert set(obj) == {"offset", "total_size", "decoded", "flags", "stored_size"}
+            assert obj["decoded"] == (original if key[0] == "trace" else foreign)[obj["offset"]:obj["offset"] + len(obj["decoded"])]
+            assert obj["total_size"] == len(original) and HEADER.size == 24
+        covers = list(interval_candidates([parse_object(blob) for blob in objects.values()]))
+        assert [len(cover) for cover in covers] == [6, 6]
+        assert {pdb_identity_bytes(b"".join(obj["decoded"] for obj in cover))[0] for cover in covers} == {guid, b"D" * 16}
         corrupted = bytearray(objects[("trace", 5)])
         corrupted[-1] ^= 1
         try:
@@ -84,12 +93,42 @@ def test_codeview_and_fragment_pipeline():
             exe, rebuilt, source = (Path(temp) / name for name in ("transport.exe", "rebuilt.bin", "original.bin"))
             exe.write_bytes(pe.data)
             source.write_bytes(original)
-            fragments = reconstruct_from_exe(exe, rebuilt, original=source)
-            assert len(fragments) == 8 and rebuilt.read_bytes() == original
+            result = reconstruct_from_exe(exe, rebuilt)
+            assert len(result["objects"]) == 8 and len(result["selected"]) == 6
+            assert len(result["candidates"]) == 2 and rebuilt.read_bytes() == original
+            assert {candidate["status"] for candidate in result["candidates"]} == {"match", "identity mismatch"}
+            # Author originals are checked only after selection, never used to choose a candidate.
+            source.write_bytes(foreign)
+            try:
+                reconstruct_from_exe(exe, rebuilt, original=source)
+            except SystemExit as error:
+                assert "differs from original" in str(error)
+            else:
+                raise AssertionError("author original influenced candidate selection")
+
+
+def test_pdb_parser_bounds():
+    good = synthetic_pdb(bytes(range(16)))
+    assert pdb_identity_bytes(good) == (bytes(range(16)), 1)
+    malformed = [good[:-1]]
+    for offset, value in ((32, 0), (3 * 4096, 80), (79 * 4096, 0xffffffff),
+                          (79 * 4096 + 32, 4), (4 * 4096 + 8, 0),
+                          (6 * 4096 + 24, 0xffffffff), (5 * 4096 + 12, 0x1001)):
+        data = bytearray(good)
+        struct.pack_into("<I", data, offset, value)
+        malformed.append(data)
+    for data in malformed:
+        try:
+            pdb_identity_bytes(data)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("malformed MSF/PDB accepted")
 
 
 if __name__ == "__main__":
     test_required_files_exist()
     test_player_text_has_no_spoilers()
     test_codeview_and_fragment_pipeline()
+    test_pdb_parser_bounds()
     print("PASS: static checks and synthetic PE32/PE32+ fragment transport")
