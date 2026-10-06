@@ -1,0 +1,8 @@
+#pragma once
+
+#include <stdint.h>
+
+static const uint32_t kTraceSeed = @TRACE_SEED@u;
+static const uint32_t kExpectedInnerLength = @INNER_LENGTH@u;
+static const uint8_t kExpectedTransformed[64] = { @EXPECTED_TRANSFORMED@ };
+static const uint8_t kPermutation[16] = { @PERMUTATION@ };
