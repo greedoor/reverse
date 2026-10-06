@@ -1,7 +1,11 @@
-.PHONY: challenge clean verify reconstruct
+.PHONY: challenge clean verify reconstruct test
 
 challenge:
 	./build.sh
+
+test:
+	python3 tests/test_static.py
+	python3 tests/test_validation.py
 
 verify:
 	python3 author/verify_challenge.py

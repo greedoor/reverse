@@ -192,9 +192,13 @@ class PE:
         for i in range(size // 28):
             e = off + i * 28
             typ = struct.unpack_from("<I", self.data, e + 12)[0]
-            sz, raw = struct.unpack_from("<II", self.data, e + 16)
             if typ != 2:
                 continue
+            sz, data_rva, raw = struct.unpack_from("<III", self.data, e + 16)
+            if not raw:
+                raw = self.rva_to_off(data_rva)
+            if raw is None or raw + sz > len(self.data):
+                die("CodeView data lies outside the file")
             blob = bytes(self.data[raw:raw + sz])
             if blob[:4] == b"RSDS":
                 guid = blob[4:20]
@@ -411,6 +415,8 @@ def build(args):
     flag = os.environ.get("CTF_FLAG")
     if not flag:
         die("set CTF_FLAG='Securinets_fst{...}' before building")
+    need_tool("clang-cl")
+    need_tool("lld-link")
     write_generated_constants(root, flag)
     build_dir = root / "build"
     dist = root / "dist"

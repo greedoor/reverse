@@ -19,6 +19,8 @@ BAD_WORDS = [
     b"exchange location",
     b"GetFlag",
     b"DecryptRealFlag",
+    b"--check",
+    b"CHECK <CODE>",
 ]
 SYMBOLS = [
     b"ValidateCandidate",
@@ -27,6 +29,16 @@ SYMBOLS = [
     b"RestoreDebugBlock",
     b"TRACE_CONTEXT",
     b"VALIDATION_STATE",
+    b"TRACE_PROFILE",
+    b"TRACE_DISPATCH",
+    b"DispatchTraceCommand",
+    b"LoadTraceProfile",
+    b"BindTraceProfile",
+    b"LoadRecordTarget",
+    b"ResolveTraceOperation",
+    b"ApplyTraceHandler",
+    b"RecordTraceResult",
+    b"RenderTraceStatus",
 ]
 
 
@@ -42,23 +54,44 @@ def read(p):
     return Path(p).read_bytes()
 
 
+def validate_private_pdb(pdb):
+    tool = os.environ.get("LLVM_PDBUTIL") or shutil.which("llvm-pdbutil")
+    if not tool:
+        fail("llvm-pdbutil required (or set LLVM_PDBUTIL to its path)")
+    parsed = subprocess.run([tool, "dump", "--summary", "--streams", "--modules",
+                             "--symbols", "--types", str(pdb)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    if parsed.returncode:
+        fail("llvm-pdbutil rejected reconstructed PDB: " + parsed.stderr.decode(errors="replace"))
+    missing = [symbol.decode() for symbol in SYMBOLS if symbol not in parsed.stdout]
+    if missing:
+        fail("missing parsed private symbols/types: " + ", ".join(missing))
+    ok("llvm-pdbutil parses streams, DBI modules, private symbols and types")
+
+
 def run_exe(exe, flag):
     if os.name == "nt":
         runner = [str(exe)]
     elif shutil.which("wine"):
         runner = ["wine", str(exe)]
     else:
-        print("SKIP: executable launch (no Windows runner or wine)")
-        return
-    bad = subprocess.run(runner + ["--check", "Securinets_fst{wrong_record}"],
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if bad.returncode == 0 or "ERR: DEBUG SET MISMATCH" not in bad.stdout:
+        fail("runtime verification requires Windows or wine")
+    bad_record = flag[:-2] + ("y" if flag[-2] == "x" else "x") + "}"
+    bad = subprocess.run(runner, input=f"OPEN {bad_record}\nQUIT\n",
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
+    if bad.returncode != 0 or "ERR: DEBUG SET MISMATCH" not in bad.stdout or "TRACE RECORD VERIFIED" in bad.stdout:
         fail("wrong flag was not rejected")
-    good = subprocess.run(runner + ["--check", flag],
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    good = subprocess.run(runner, input=f"OPEN {flag}\nQUIT\n",
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
     if good.returncode != 0 or "TRACE RECORD VERIFIED" not in good.stdout:
         fail("correct flag was not accepted")
     ok("runtime flag behavior")
+
+    removed = subprocess.run(runner + ["--check", flag], input="HELP\nCHECK ignored\nQUIT\n",
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
+    if removed.returncode != 0 or "TRACE RECORD VERIFIED" in removed.stdout or "CHECK <CODE>" in removed.stdout:
+        fail("removed check interface remains accessible")
+    ok("player exposes no CHECK command or command-line validator")
 
 
 def zip_bytes(zip_path):
@@ -114,6 +147,7 @@ def main():
     missing = [s.decode() for s in SYMBOLS if s not in pdb_data]
     if missing:
         fail("missing expected private symbols/types: " + ", ".join(missing))
+    validate_private_pdb(reconstructed)
     ok("expected private symbols present")
 
     if flag.encode() in read(exe) or flag.encode() in pdb_data:
@@ -146,12 +180,15 @@ def main():
         f"pdb_reconstructed_sha256: {sha256(reconstructed)}\n"
         "byte_match: YES\n"
         "exe_pdb_identity: YES\n"
+        "pdb_tool_validation: PASS\n"
         "real_fragments: 6\n"
         "decoys: 2\n"
         "ghidra_symbol_import: MANUAL VERIFICATION REQUIRED\n"
         "flag_leak_scan: PASS\n"
         "story_spoiler_scan: PASS\n"
         "player_package: PASS\n"
+        "runtime_verification: PASS\n"
+        "player_check_shortcut: ABSENT\n"
     )
     (dist / "author/hashes.txt").write_text(
         f"{sha256(exe)}  RAVTRACE.EXE\n"

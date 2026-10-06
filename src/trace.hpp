@@ -22,24 +22,58 @@ struct LOT_RECORD {
     char status[12];
 };
 
+enum TRACE_STATUS {
+    TRACE_SILENT = 0,
+    TRACE_NO_RECORD = 0x10,
+    TRACE_MISMATCH = 0x23,
+    TRACE_MATCH = 0x37,
+    TRACE_OPENED = 0x48,
+    TRACE_READY = 0x59
+};
+
+struct TRACE_PROFILE {
+    uint32_t mode;
+    uint32_t seed_bias;
+    uint32_t target_size;
+    uint32_t key_phase;
+    uint32_t rotation_period;
+    uint8_t permutation[16];
+};
+
 struct TRACE_CONTEXT {
     uint32_t seed;
-    uint8_t key[8];
-    uint8_t expected_digest[32];
+    uint32_t lot_id;
+    uint32_t key_state;
+    uint32_t mode;
+    uint32_t target_size;
+    uint32_t key_phase;
+    uint32_t rotation_period;
     uint8_t permutation[16];
+    uint8_t target[64];
+    TRACE_STATUS last_status;
     uint32_t flags;
 };
 
 struct VALIDATION_STATE {
     uint32_t state;
+    uint32_t payload_size;
     uint8_t working_key[8];
     uint8_t transformed[64];
+};
+
+typedef TRACE_STATUS (*TRACE_HANDLER)(const TRACE_CONTEXT*, VALIDATION_STATE*, const char*);
+
+struct TRACE_DISPATCH {
+    uint32_t mode;
+    TRACE_HANDLER handler;
+    TRACE_STATUS accepted_status;
 };
 
 void InitializeTraceEngine(TRACE_CONTEXT* ctx);
 void ResetTraceState(TRACE_CONTEXT* ctx);
 int LoadTraceHeader(const TRACE_BLOCK* block);
 int ReadLotRecord(uint32_t lot_id, LOT_RECORD* record);
+int ParseLotIdentifier(const char* text, uint32_t* lot_id);
 int ParseTraceBlock(const uint8_t* raw, uint32_t raw_size, TRACE_BLOCK* out);
 int NormalizeTraceBlock(TRACE_BLOCK* block);
 uint32_t DecodeTraceSequence(uint32_t encoded_sequence);
@@ -52,3 +86,11 @@ void FormatDiagnosticLine(char* out, uint32_t out_size, const char* key, const c
 void ClearWorkBuffer(void* ptr, uint32_t size);
 int LoadTraceContext(TRACE_CONTEXT* ctx);
 int OpenRelayRecord(uint32_t relay_id, LOT_RECORD* out);
+int LoadTraceProfile(const LOT_RECORD* record, TRACE_PROFILE* profile);
+void BindTraceProfile(TRACE_CONTEXT* ctx, const LOT_RECORD* record, const TRACE_PROFILE* profile);
+const TRACE_DISPATCH* ResolveTraceOperation(const TRACE_CONTEXT* ctx);
+TRACE_STATUS ApplyTraceHandler(const TRACE_DISPATCH* operation, const TRACE_CONTEXT* ctx,
+                              VALIDATION_STATE* state, const char* record);
+TRACE_STATUS ProcessTraceRecord(TRACE_CONTEXT* ctx, const char* record);
+TRACE_STATUS RecordTraceResult(TRACE_CONTEXT* ctx, TRACE_STATUS status);
+void RenderTraceStatus(TRACE_STATUS status);

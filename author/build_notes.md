@@ -15,12 +15,12 @@ Required tools:
 - lld-link
 - MSVC runtime libraries or Build Tools
 - Windows SDK import libraries
+- llvm-pdbutil (or its path in LLVM_PDBUTIL) for full artifact verification
+- Windows or wine for interactive runtime verification
 
 Optional validation:
 
-- llvm-pdbutil
 - llvm-readobj
-- wine, when cross-building from Linux
 - Ghidra headless analyzer
 
 If `clang-cl` or `lld-link` is missing, the build fails. That is deliberate:

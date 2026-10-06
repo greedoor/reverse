@@ -16,3 +16,9 @@ The build requires a real PDB-capable Windows toolchain:
 
 No fake PDB fallback is provided. If those tools are missing, the build stops
 before producing player artifacts.
+
+Run `make test` for host C++ checks (clang++ with ASan/UBSan) and synthetic PE
+fragment transport tests. These do not replace a real Windows/PDB build.
+The full artifact verifier requires llvm-pdbutil and Windows or Wine, and tests the interactive
+`OPEN` path; the player executable has no command-line validation shortcut.
+See `author/REVIEW.md` for the baseline, changes, and outstanding artifact review.

@@ -1,9 +1,7 @@
 #include "trace.hpp"
-#include "validation.hpp"
 
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
 
 static void Banner(void) {
     puts("================================================");
@@ -22,7 +20,7 @@ static void Help(void) {
     puts("HELP");
     puts("INFO");
     puts("TRACE <ID>");
-    puts("CHECK <CODE>");
+    puts("OPEN <RECORD>");
     puts("QUIT");
 }
 
@@ -33,48 +31,48 @@ static void Info(void) {
     puts("SYMBOL SET   : NO RECORD");
 }
 
-static void Trace(const char* id) {
+static TRACE_STATUS Trace(TRACE_CONTEXT* ctx, const char* id) {
     LOT_RECORD rec;
-    uint32_t lot = id ? (uint32_t)strtoul(id, 0, 16) : 0;
+    uint32_t lot;
+    if (!ParseLotIdentifier(id, &lot)) return TRACE_NO_RECORD;
     if (!ReadLotRecord(lot, &rec)) {
-        puts("ERR: TRACE RECORD INVALID");
-        return;
+        return TRACE_NO_RECORD;
     }
+    ctx->lot_id = lot;
+    if (!LoadTraceContext(ctx)) return TRACE_NO_RECORD;
     printf("LOT %08lX : SEALED\n", (unsigned long)rec.lot_id);
     puts("RELAY      : MASKED");
     puts("DEBUG SET  : MISMATCH");
+    return TRACE_SILENT;
 }
 
-static void Check(const char* code) {
-    if (ValidateCandidate(code)) {
-        puts("TRACE RECORD VERIFIED");
-        puts("DEBUG SET    : ACCEPTED");
-    } else {
-        puts("ERR: DEBUG SET MISMATCH");
-    }
+__declspec(noinline) TRACE_STATUS DispatchTraceCommand(TRACE_CONTEXT* ctx, const char* line) {
+    if (_stricmp(line, "HELP") == 0) Help();
+    else if (_stricmp(line, "INFO") == 0) Info();
+    else if (_strnicmp(line, "TRACE ", 6) == 0) return Trace(ctx, line + 6);
+    else if (_strnicmp(line, "OPEN ", 5) == 0) return ProcessTraceRecord(ctx, line + 5);
+    else if (line[0]) return TRACE_NO_RECORD;
+    return TRACE_SILENT;
 }
 
-int main(int argc, char** argv) {
+int main(void) {
     char line[256];
     TRACE_CONTEXT ctx;
     InitializeTraceEngine(&ctx);
-
-    if (argc == 3 && strcmp(argv[1], "--check") == 0) {
-        Check(argv[2]);
-        return ValidateCandidate(argv[2]) ? 0 : 1;
-    }
 
     Banner();
     for (;;) {
         fputs("> ", stdout);
         if (!fgets(line, sizeof(line), stdin)) break;
+        if (!strchr(line, '\n') && !feof(stdin)) {
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF) {}
+            RenderTraceStatus(TRACE_NO_RECORD);
+            continue;
+        }
         line[strcspn(line, "\r\n")] = 0;
-        if (_stricmp(line, "HELP") == 0) Help();
-        else if (_stricmp(line, "INFO") == 0) Info();
-        else if (_strnicmp(line, "TRACE ", 6) == 0) Trace(line + 6);
-        else if (_strnicmp(line, "CHECK ", 6) == 0) Check(line + 6);
-        else if (_stricmp(line, "QUIT") == 0) break;
-        else if (line[0]) puts("ERR: NO RECORD");
+        if (_stricmp(line, "QUIT") == 0) break;
+        RenderTraceStatus(DispatchTraceCommand(&ctx, line));
     }
     ClearWorkBuffer(&ctx, sizeof(ctx));
     return 0;

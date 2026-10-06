@@ -152,26 +152,46 @@ Useful names appear:
 
 ```text
 LoadTraceContext
+LoadTraceProfile
+BindTraceProfile
+LoadRecordTarget
+ResolveTraceOperation
+ApplyTraceHandler
 DeriveTraceKey
 TransformCandidate
 ValidateCandidate
 CompareRecordDigest
+RecordTraceResult
+RenderTraceStatus
 RestoreDebugBlock
 VerifyTraceBlock
 ```
 
-Types such as `TRACE_CONTEXT`, `TRACE_BLOCK`, and `VALIDATION_STATE` clarify
-field offsets.
+Types such as `TRACE_CONTEXT`, `TRACE_PROFILE`, `TRACE_DISPATCH`, `TRACE_BLOCK`,
+and `VALIDATION_STATE` clarify field offsets. Follow the default lot `0x0711`
+through `ReadLotRecord`, `DecodeLotRecord`, profile loading, and binding. The
+handler table is physically ordered cache, inventory, sealed. Match its mode
+against `ctx->mode`, rather than assuming table order is execution order.
 
 ## 18. Final Validation Function
 
-`ValidateCandidate` checks an obfuscated wrapper equivalent to:
+The terminal accepts `OPEN <RECORD>`. Its dispatch calls `ProcessTraceRecord`,
+which resolves a typed handler entry from the current context. `ValidateCandidate`
+serves both the sealed-record and cache profiles; inventory uses `OpenLotRecord`.
+The shared comparator only reads `ctx->target`, `ctx->target_size`, and the
+transformed state. It neither creates the profile nor selects the target.
+
+In mode 1, `ValidateCandidate` checks an obfuscated wrapper equivalent to:
 
 ```text
 Securinets_fst{...}
 ```
 
-The plaintext full flag is not stored.
+The plaintext full flag is not stored. Mode 2 instead uses a local cache record.
+Neither an ordinary lot opening nor cache acceptance recovers the sealed record.
+`TRACE_MATCH` passes through the selected dispatch entry, `RecordTraceResult`,
+and `RenderTraceStatus`; the success text is shared with inventory openings.
+An XREF to that text reaches the renderer, not a standalone flag checker.
 
 ## 19. Key Derivation
 
@@ -182,7 +202,16 @@ state = state * 1103515245 + 12345;
 key[i] = (state >> 16) & 0xff;
 ```
 
-Seed: `0x41c6a7d3`.
+The initial seed is `0x41c6a7d3`. `DecodeLotRecord` unmasks the record's relay
+field, and `BindTraceProfile` sets:
+
+```c
+ctx->key_state = ctx->seed ^ record->relay_id ^ profile->seed_bias;
+```
+
+For the default sealed lot, the decoded relay and bias are both `0x0711`, so
+the LCG starts at the initial seed. Other lots can produce different key states.
+Key derivation starts from `ctx->key_state`, not directly from `ctx->seed`.
 
 ## 20. Transformation Recovery
 
@@ -197,9 +226,13 @@ Permutation:
 ```
 
 For a short final block, ignore permutation entries outside the block and then
-append any unused positions in ascending order. The transformed target and
-inner length are constants in the binary. Reverse the rotations, inverse
-permutation, and XOR key to recover the inner text.
+append any unused positions in ascending order. `LoadTraceProfile` supplies
+the target length, permutation, key phase, and rotation period. For the default
+sealed profile, phase is 0 and period is 5. `LoadRecordTarget` copies the sealed
+target into the context; for cache mode it computes a different target using the
+same transform. Recover the sealed context's target, reverse its rotations,
+inverse permutation, and XOR key to recover the inner text. Examining the
+comparator alone leaves these inputs unresolved.
 
 ## 21. Flag Recovery
 
@@ -211,16 +244,14 @@ $CTF_FLAG
 
 Verify:
 
-```sh
-RAVTRACE.EXE --check 'Securinets_fst{...}'
-```
-
-Expected success:
-
 ```text
+> OPEN Securinets_fst{...}
 TRACE RECORD VERIFIED
-DEBUG SET    : ACCEPTED
 ```
+
+The default lot is already selected at startup. After experimenting with other
+lots, use `TRACE 0711` before opening the recovered sealed record. There is no
+player command-line validation mode. Author tests send commands on standard input.
 
 ## 22. Handoff
 
